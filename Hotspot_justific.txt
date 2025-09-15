@@ -1,0 +1,51 @@
+BCV - Jacobi without the implementation of SVD :
+
+What is the goal?
+
+First orthogonalize the main matrix A. Then approximate the singular values in column norms.
+There is no full decomposition such as the SVD.
+
+How it is implemented?
+
+1. Matrix split into blocks 
+
+2. Pick two blocks (they are stored into the matrix U).
+
+3. Jacobi rotations (For each pair of columns in 𝑈, compute a Givens rotation (𝑐,𝑠) to reduce off-diagonal correlation.)
+(Then apply it to those columns so that they become more orthogonal. This process is repeated for 2k-1 rounds to sweep through all pairs)
+
+4. Store back (Replacing the two original blocks in 𝐴 with the updated ones.)
+
+5. Sweep loop (Iterating over all block pairs, repeating till converges)
+
+6. Normalization (All columns of A are normalized, column norms approximate the singular values. Only left singular vectors are tracked).
+
+BCV - Jacobi with SVD implementation :
+
+What are the changes in the implementation ?
+
+Until step 3 same process. Instead of store back here we rotations to V.
+
+{Keep a global matrix 𝑉∈𝑅𝑛×𝑛 initialized as identity. For each Jacobi rotation on columns i,j, apply the same 2×2 rotation to columns i,j of V.
+After all sweeps: V accumulates the full product of Jacobi rotations → right singular vectors.}
+
+Then again the same Normalization.
+
+The complexity comparision is as :
+
+BCV is making into blocks updating all that process has O(m*n^2). Where as in the BCV-SVD the rotations are a huge task, So the additional 
+comlexity of the rotation is added to the complexity of the BCV. That results to O(m*n^2 + n^3).
+
+When compared the gprof reports the execution times for both versions was identical for smaller datasets. But when the dataset is 
+much bigger the bcv-svd execution time was twice or thrice that of the bcv. 
+The reason for that behaviour is that the bcv-svd involves a rotation function where the complexity n^3.
+
+
+Based on these facts from the gprofiling the time consumption is very high in matrices in blocks and jacobi rotations, and also rotations
+for the matrix V(in bcv-svd). But as of the BCV the code execution pattern is sequential and each of them is dependent on the previous 
+result. whereas in the BCV-SVD algorithm we can parallelize the rotations using openMP and CUDA.
+
+Though the BCV is faster in sequential it rather falls behind when methods like openMP and CUDA are used for parallelization.
+As mentioned in reference paper the parallelized BCV Jacob SVd is faster than the original.
+
+Other components are not being parallelizable due to their dependency to one or more factors.

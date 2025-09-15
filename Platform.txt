@@ -1,0 +1,21 @@
+In this case the methods suitable for parallelising are openMP and CUDA.
+
+why?
+
+The openMP platform provides us with multithread operations. This results in faster execution and improves the speedup. The only drawback 
+is that it is limited to the CPU's power and the number of threads.
+With OpenMP, computationally heavy parts (like loops over rows/columns of a matrix) can be divided across multiple CPU cores.
+The loop iterations are also parallelized.
+
+The CUDA is the most suitable for this code because, it uses GPU, which has thousands of lightweight cores designed for parallelism.
+GPUs are optimized for data-parallel workloads (doing the same operation on many elements).
+
+In this case, large matrix multiplications, SVD, and vector computations are all data-parallel problems → each element can be computed independently.
+
+
+The BCV(parallel) and BCV_SVD(parallel) into comparison, for smaller datasets BCV(parallel) might have lower execution times but 
+when  the dataset is larger the execution times of the BCV-SVD is much smaller. Thats what mentioned in the refrence paper too.
+
+The reason why MPI is not selected is that the components involved in it requires intercommunication between them, which is the 
+drawback in MPI. If implemented the communication overhead is the larger part than that of the compuatation.
+So the preferred paltforms are openMP and CUDA
