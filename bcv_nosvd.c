@@ -1,126 +1,120 @@
-// bcv_only_timed.c
-// BCV Jacobi (blocked) - timed, WITHOUT accumulating V (no full SVD).
-// Compile: gcc -O3 -march=native -std=c11 bcv_only_timed.c -o bcv_only_timed -lm
-// Run example: ./bcv_only_timed 2000 2000 20 5
-
+// corrected_bcv_simple.c  -- minimal fixes (contiguous column-major, offset loading, one local sweep)
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <sys/time.h>
+#include <string.h> // for memset
 
 double wall_time() {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec + tv.tv_usec * 1e-6;
+    struct timeval tv; gettimeofday(&tv,NULL); return tv.tv_sec + tv.tv_usec*1e-6;
 }
 
-double **allocate_matrix(int rows, int cols) {
-    double **M = malloc(rows * sizeof(double*));
-    for (int i = 0; i < rows; ++i) {
-        M[i] = malloc(cols * sizeof(double));
-    }
+double *allocate_mat_colmajor(int m, int n) {
+    double *M = NULL;
+    size_t bytes = sizeof(double) * (size_t)m * (size_t)n;
+    if (posix_memalign((void**)&M, 64, bytes) != 0) return NULL;
+    /* zero initialize to avoid reading uninitialized memory */
+    memset(M, 0, bytes);
     return M;
 }
+#define A_at(A,m,i,j) ((A)[ (size_t)(j)*(m) + (i) ])  // column-major
 
-void free_matrix(double **M, int rows) {
-    for (int i = 0; i < rows; ++i) free(M[i]);
-    free(M);
-}
-
-double column_norm_sq(double **A, int m, int col) {
+double column_norm_sq_col(const double *A, int m, int col) {
     double s = 0.0;
-    for (int i = 0; i < m; ++i) { double v = A[i][col]; s += v*v; }
+    const double *colptr = A + (size_t)col * m;
+    for (int i=0;i<m;++i){ double v = colptr[i]; s += v*v; }
     return s;
 }
-
-double column_dot(double **A, int m, int c1, int c2) {
+double column_dot_col(const double *A, int m, int c1, int c2) {
     double s = 0.0;
-    for (int i = 0; i < m; ++i) s += A[i][c1] * A[i][c2];
+    const double *p1 = A + (size_t)c1 * m, *p2 = A + (size_t)c2 * m;
+    for (int i=0;i<m;++i) s += p1[i] * p2[i];
     return s;
 }
-
-void scale_column(double **A, int m, int col, double scale) {
-    for (int i = 0; i < m; ++i) A[i][col] *= scale;
+void scale_column_col(double *A, int m, int col, double scale) {
+    double *p = A + (size_t)col*m;
+    for (int i=0;i<m;++i) p[i] *= scale;
 }
 
-void load_submatrix(double **U, double **A, int m, int start_col, int k) {
-    for (int i = 0; i < m; ++i)
-        for (int j = 0; j < k; ++j)
-            U[i][j] = A[i][start_col + j];
+void load_submatrix_offset(double *U, const double *A, int m, int n,
+                           int start_col, int k, int col_offset, int two_k) {
+    // U stored column-major with width two_k
+    for (int j=0;j<k;++j){
+        const double *src = A + (size_t)(start_col + j) * m;
+        double *dst = U + (size_t)(col_offset + j) * m;
+        for (int i=0;i<m;++i) dst[i] = src[i];
+    }
+}
+void store_submatrix_offset(double *A, const double *U, int m, int n,
+                            int start_col, int k, int col_offset, int two_k) {
+    for (int j=0;j<k;++j){
+        const double *src = U + (size_t)(col_offset + j)*m;
+        double *dst = A + (size_t)(start_col + j)*m;
+        for (int i=0;i<m;++i) dst[i] = src[i];
+    }
 }
 
-void store_submatrix(double **A, double **U, int m, int start_col, int k) {
-    for (int i = 0; i < m; ++i)
-        for (int j = 0; j < k; ++j)
-            A[i][start_col + j] = U[i][j];
-}
-
-void givens_rotation_local(double **U, int m, int k_local) {
-    for (int i = 0; i < k_local - 1; ++i) {
-        for (int j = i + 1; j < k_local; ++j) {
-            double alpha = column_norm_sq(U, m, i);
-            double beta  = column_norm_sq(U, m, j);
-            double gamma = column_dot(U, m, i, j);
+// Basic Givens sweep on U (2k columns, column-major)
+void givens_rotation_local(double *U, int m, int two_k) {
+    for (int i = 0; i < two_k - 1; ++i) {
+        for (int j = i + 1; j < two_k; ++j) {
+            double alpha = 0.0, beta = 0.0, gamma = 0.0;
+            double *pi = U + (size_t)i*m, *pj = U + (size_t)j*m;
+            for (int r = 0; r < m; ++r) {
+                double ui = pi[r], uj = pj[r];
+                alpha += ui*ui; beta += uj*uj; gamma += ui*uj;
+            }
             if (fabs(gamma) < 1e-14) continue;
-
             double tau = (beta - alpha) / (2.0 * gamma);
             double t = (tau >= 0.0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau*tau));
             double c = 1.0 / sqrt(1.0 + t*t);
             double s = t * c;
-
             for (int r = 0; r < m; ++r) {
-                double ui = U[r][i];
-                double uj = U[r][j];
-                U[r][i] = c*ui - s*uj;
-                U[r][j] = s*ui + c*uj;
+                double ui = pi[r], uj = pj[r];
+                pi[r] = c*ui - s*uj;
+                pj[r] = s*ui + c*uj;
             }
         }
     }
 }
 
-int main(int argc, char **argv) {
-    int m = 2000, n = 2000, k = 20, sweeps = 5;
-    if (argc >= 5) {
-        m = atoi(argv[1]); n = atoi(argv[2]); k = atoi(argv[3]); sweeps = atoi(argv[4]);
-    } else {
-        printf("Usage: %s m n k sweeps  (defaults 2000 2000 20 5)\n", argv[0]);
-    }
-    if (n % k != 0) { fprintf(stderr, "n must be divisible by k\n"); return 1; }
+int main(int argc, char **argv){
+    int m=2000,n=2000,k=20,sweeps=5;
+    if (argc>=5){ m=atoi(argv[1]); n=atoi(argv[2]); k=atoi(argv[3]); sweeps=atoi(argv[4]); }
+    if (n % k != 0){ fprintf(stderr,"n must be divisible by k\n"); return 1; }
+    printf("BCV-Jacobi (no V) %dx%d k=%d sweeps=%d\n",m,n,k,sweeps);
 
-    printf("BCV-Jacobi (no V) on %dx%d, k=%d, sweeps=%d\n", m, n, k, sweeps);
+    double *A = allocate_mat_colmajor(m,n);
+    if (A == NULL) { fprintf(stderr,"Allocation A failed\n"); return 1; }
 
-    double **A = allocate_matrix(m, n);
-    for (int i = 0; i < m; ++i)
-        for (int j = 0; j < n; ++j)
-            A[i][j] = sin((double)(i+1))*cos((double)(j+1)) + ((i+j)%7)*0.01;
+    for (int j=0;j<n;++j) for (int i=0;i<m;++i) A_at(A,m,i,j) = sin((double)(i+1))*cos((double)(j+1)) + ((i+j)%7)*0.01;
 
-    double **U = allocate_matrix(m, 2*k);
-
-    double t0 = wall_time();
+    int two_k = 2*k;
+    double *U = allocate_mat_colmajor(m, two_k);
+    if (U == NULL) { fprintf(stderr,"Allocation U failed\n"); free(A); return 1; }
 
     int blocks = n / k;
-    for (int sweep = 0; sweep < sweeps; ++sweep) {
-        for (int q = 0; q < blocks - 1; ++q) {
-            load_submatrix(U, A, m, q*k, k);
-            for (int p = q + 1; p < blocks; ++p) {
-                load_submatrix(U, A, m, p*k, k);
-                for (int r = 0; r < 2*k - 1; ++r) {
-                    givens_rotation_local(U, m, 2*k);
-                }
-                store_submatrix(A, U, m, p*k, k);
+    double t0 = wall_time();
+    for (int sweep=0; sweep<sweeps; ++sweep) {
+        for (int q=0; q<blocks-1; ++q) {
+            load_submatrix_offset(U, A, m, n, q*k, k, 0, two_k);
+            for (int p=q+1; p<blocks; ++p) {
+                load_submatrix_offset(U, A, m, n, p*k, k, k, two_k); // load second block into offset k
+                // single local sweep (you can do more iterations if desired)
+                givens_rotation_local(U, m, two_k);
+                store_submatrix_offset(A, U, m, n, p*k, k, k, two_k);
             }
-            store_submatrix(A, U, m, q*k, k);
+            store_submatrix_offset(A, U, m, n, q*k, k, 0, two_k);
         }
-        for (int col = 0; col < n; ++col) {
-            double norm = sqrt(column_norm_sq(A, m, col));
-            if (norm > 1e-14) scale_column(A, m, col, 1.0/norm);
+        // normalize columns
+        for (int col=0; col<n; ++col) {
+            double nrm = sqrt(column_norm_sq_col(A, m, col));
+            if (nrm > 1e-14) scale_column_col(A, m, col, 1.0 / nrm);
         }
     }
-
     double t1 = wall_time();
-    printf("Elapsed time (BCV only) = %.6f seconds\n", t1 - t0);
+    printf("Elapsed time(BCV only) = %.6f s\n", t1 - t0);
 
-    free_matrix(U, m);
-    free_matrix(A, m);
+    free(A); free(U);
     return 0;
 }

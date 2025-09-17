@@ -3,10 +3,12 @@
 // Compile: gcc -O3 -march=native -std=c11 bcv_svd_timed.c -o bcv_svd_timed -lm
 // Run example: ./bcv_svd_timed 1500 1500 30 4
 
+#define _POSIX_C_SOURCE 200112L
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <sys/time.h>
+#include <string.h>
 
 double wall_time() {
     struct timeval tv;
@@ -14,138 +16,210 @@ double wall_time() {
     return tv.tv_sec + tv.tv_usec * 1e-6;
 }
 
-double **allocate_matrix(int rows, int cols) {
-    double **M = malloc(rows * sizeof(double*));
-    for (int i = 0; i < rows; ++i) M[i] = malloc(cols * sizeof(double));
-    return M;
+#define A_AT(A,m,row,col) ((A)[ (size_t)(col) * (m) + (row) ])
+
+static double *aligned_alloc_d(size_t elems) {
+    void *ptr = NULL;
+    size_t bytes = elems * sizeof(double);
+    if (posix_memalign(&ptr, 64, bytes) != 0) return NULL;
+    memset(ptr, 0, bytes);
+    return (double*)ptr;
 }
 
-void free_matrix(double **M, int rows) {
-    for (int i = 0; i < rows; ++i) free(M[i]);
-    free(M);
+static void init_A(double *A, int m, int n) {
+    for (int j=0; j<n; ++j)
+        for (int i=0; i<m; ++i)
+            A_AT(A,m,i,j) = sin((double)(i+1)) * cos((double)(j+1)) + ((i+j)%11) * 0.01;
 }
 
-double column_norm_sq(double **A, int m, int col) {
-    double s = 0.0;
-    for (int i = 0; i < m; ++i) { double v = A[i][col]; s += v*v; }
-    return s;
+static void init_V_identity(double *V, int n) {
+    for (int j=0;j<n;++j)
+        for (int i=0;i<n;++i)
+            V[(size_t)j * n + i] = (i==j) ? 1.0 : 0.0;
 }
 
-double column_dot(double **A, int m, int c1, int c2) {
-    double s = 0.0;
-    for (int i = 0; i < m; ++i) s += A[i][c1]*A[i][c2];
-    return s;
-}
-
-void scale_column(double **A, int m, int col, double scale) {
-    for (int i = 0; i < m; ++i) A[i][col] *= scale;
-}
-
-void load_submatrix(double **U, double **A, int m, int start_col, int k) {
-    for (int i = 0; i < m; ++i)
-        for (int j = 0; j < k; ++j)
-            U[i][j] = A[i][start_col + j];
-}
-
-void store_submatrix(double **A, double **U, int m, int start_col, int k) {
-    for (int i = 0; i < m; ++i)
-        for (int j = 0; j < k; ++j)
-            A[i][start_col + j] = U[i][j];
-}
-
-void apply_rotation_to_matrix(double **M, int rows, int gi, int gj, double c, double s) {
-    for (int r = 0; r < rows; ++r) {
-        double mi = M[r][gi];
-        double mj = M[r][gj];
-        M[r][gi] = c*mi - s*mj;
-        M[r][gj] = s*mi + c*mj;
-    }
-}
-
-void givens_rotation_local_with_V(double **U, int m, int k_local, int *col_idx,
-                                  double **V, int n) {
-    for (int i = 0; i < k_local - 1; ++i) {
-        for (int j = i + 1; j < k_local; ++j) {
-            double alpha = column_norm_sq(U, m, i);
-            double beta  = column_norm_sq(U, m, j);
-            double gamma = column_dot(U, m, i, j);
-            if (fabs(gamma) < 1e-14) continue;
-
-            double tau = (beta - alpha) / (2.0 * gamma);
-            double t = (tau >= 0.0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau*tau));
-            double c = 1.0 / sqrt(1.0 + t*t);
-            double s = t * c;
-
-            for (int r = 0; r < m; ++r) {
-                double ui = U[r][i];
-                double uj = U[r][j];
-                U[r][i] = c*ui - s*uj;
-                U[r][j] = s*ui + c*uj;
+/* simple GEMM */
+static void dgemm_simple(char opA, char opB,
+                         int m, int n, int k,
+                         double alpha,
+                         const double *A, int lda,
+                         const double *B, int ldb,
+                         double beta,
+                         double *C, int ldc)
+{
+    for (int jc = 0; jc < n; ++jc) {
+        for (int ic = 0; ic < m; ++ic) {
+            double sum = 0.0;
+            if (opA == 'N' && opB == 'N') {
+                for (int l = 0; l < k; ++l)
+                    sum += A[(size_t)l * lda + ic] * B[(size_t)jc * ldb + l];
+            } else if (opA == 'T' && opB == 'N') {
+                for (int l = 0; l < k; ++l)
+                    sum += A[(size_t)ic * lda + l] * B[(size_t)jc * ldb + l];
+            } else if (opA == 'N' && opB == 'T') {
+                for (int l = 0; l < k; ++l)
+                    sum += A[(size_t)l * lda + ic] * B[(size_t)l * ldb + jc];
+            } else { // 'T','T'
+                for (int l = 0; l < k; ++l)
+                    sum += A[(size_t)ic * lda + l] * B[(size_t)l * ldb + jc];
             }
-
-            int gi = col_idx[i];
-            int gj = col_idx[j];
-            apply_rotation_to_matrix(V, n, gi, gj, c, s);
+            double cval = C[(size_t)jc * ldc + ic];
+            C[(size_t)jc * ldc + ic] = alpha * sum + beta * cval;
         }
     }
 }
 
-int main(int argc, char **argv) {
-    int m = 1500, n = 1500, k = 30, sweeps = 4;
-    if (argc >= 5) {
-        m = atoi(argv[1]); n = atoi(argv[2]); k = atoi(argv[3]); sweeps = atoi(argv[4]);
-    } else {
-        printf("Usage: %s m n k sweeps  (defaults 1500 1500 30 4)\n", argv[0]);
+/* Jacobi eigensolver */
+static void jacobi_eigen_small(double *G, double *R, int k, int max_iter, double tol) {
+    for (int j=0;j<k;++j)
+        for (int i=0;i<k;++i)
+            R[(size_t)j * k + i] = (i==j) ? 1.0 : 0.0;
+
+    for (int iter=0; iter<max_iter; ++iter) {
+        double max_off = 0.0; int p=-1, q=-1;
+        for (int col=0; col<k; ++col)
+            for (int row=0; row<col; ++row) {
+                double a = fabs(G[(size_t)col * k + row]);
+                if (a > max_off) { max_off = a; p = row; q = col; }
+            }
+        if (max_off < tol) break;
+        double App = G[(size_t)p * k + p];
+        double Aqq = G[(size_t)q * k + q];
+        double Apq = G[(size_t)q * k + p];
+        if (fabs(Apq) < 1e-18) continue;
+        double tau = (Aqq - App) / (2.0 * Apq);
+        double t = (tau >= 0.0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau*tau));
+        double c = 1.0 / sqrt(1.0 + t*t);
+        double s = t * c;
+        for (int r = 0; r < k; ++r) {
+            if (r == p || r == q) continue;
+            double Grp = G[(size_t)p * k + r];
+            double Grq = G[(size_t)q * k + r];
+            double new_rp = c * Grp - s * Grq;
+            double new_rq = s * Grp + c * Grq;
+            G[(size_t)p * k + r] = new_rp;
+            G[(size_t)r * k + p] = new_rp;
+            G[(size_t)q * k + r] = new_rq;
+            G[(size_t)r * k + q] = new_rq;
+        }
+        double new_pp = c*c*App - 2.0*s*c*Apq + s*s*Aqq;
+        double new_qq = s*s*App + 2.0*s*c*Apq + c*c*Aqq;
+        G[(size_t)p * k + p] = new_pp;
+        G[(size_t)q * k + q] = new_qq;
+        G[(size_t)q * k + p] = 0.0;
+        G[(size_t)p * k + q] = 0.0;
+        for (int r = 0; r < k; ++r) {
+            double Rip = R[(size_t)p * k + r];
+            double Riq = R[(size_t)q * k + r];
+            R[(size_t)p * k + r] = c * Rip - s * Riq;
+            R[(size_t)q * k + r] = s * Rip + c * Riq;
+        }
     }
+}
+
+static void normalize_columns(double *A, int m, int n) {
+    for (int col=0; col<n; ++col) {
+        double s = 0.0;
+        double *colptr = A + (size_t)col * m;
+        for (int i=0;i<m;++i) { double v = colptr[i]; s += v*v; }
+        double nrm = sqrt(s);
+        if (nrm > 1e-14) {
+            double inv = 1.0 / nrm;
+            for (int i=0;i<m;++i) colptr[i] *= inv;
+        }
+    }
+}
+
+int main(void) {
+    int m = 2000, n = 2000, k = 20, sweeps = 5;
     if (n % k != 0) { fprintf(stderr, "n must be divisible by k\n"); return 1; }
+    printf("BCV-Jacobi WITH V (no BLAS, serial) on %dx%d, k=%d, sweeps=%d\n", m, n, k, sweeps);
 
-    printf("BCV-Jacobi WITH V (full SVD) on %dx%d, k=%d, sweeps=%d\n", m, n, k, sweeps);
+    size_t m_n = (size_t)m * (size_t)n;
+    size_t n_n = (size_t)n * (size_t)n;
+    size_t two_k = (size_t)2 * (size_t)k;
+    double *A = aligned_alloc_d(m_n);
+    double *V = aligned_alloc_d(n_n);
+    double *Ubuf = aligned_alloc_d((size_t)m * two_k);
+    double *G = aligned_alloc_d(two_k * two_k);
+    double *R = aligned_alloc_d(two_k * two_k);
+    double *Utmp = aligned_alloc_d((size_t)m * two_k);
+    double *Vsub = aligned_alloc_d((size_t)n * two_k);
+    double *Vtmp = aligned_alloc_d((size_t)n * two_k);
 
-    double **A = allocate_matrix(m, n);
-    double **V = allocate_matrix(n, n);
+    if (!A || !V || !Ubuf || !G || !R || !Utmp || !Vsub || !Vtmp) {
+        fprintf(stderr,"allocation failed\n");
+        return 1;
+    }
 
-    for (int i = 0; i < m; ++i)
-        for (int j = 0; j < n; ++j)
-            A[i][j] = sin((double)(i+1))*cos((double)(j+1)) + ((i+j)%11)*0.01;
+    init_A(A, m, n);
+    init_V_identity(V, n);
 
-    for (int i = 0; i < n; ++i)
-        for (int j = 0; j < n; ++j)
-            V[i][j] = (i==j)?1.0:0.0;
-
-    double **Ubuf = allocate_matrix(m, 2*k);
-    int *col_idx = malloc(2*k * sizeof(int));
-
+    int blocks = n / k;
     double t0 = wall_time();
 
-    int blocks = n/k;
     for (int sweep = 0; sweep < sweeps; ++sweep) {
         for (int q = 0; q < blocks - 1; ++q) {
-            load_submatrix(Ubuf, A, m, q*k, k);
-            for (int t = 0; t < k; ++t) col_idx[t] = q*k + t;
-
-            for (int p = q + 1; p < blocks; ++p) {
-                load_submatrix(Ubuf, A, m, p*k, k);
-                for (int t = 0; t < k; ++t) col_idx[k+t] = p*k + t;
-
-                for (int r = 0; r < 2*k - 1; ++r)
-                    givens_rotation_local_with_V(Ubuf, m, 2*k, col_idx, V, n);
-
-                store_submatrix(A, Ubuf, m, p*k, k);
+            for (int jj = 0; jj < k; ++jj) {
+                double *dst = Ubuf + (size_t)jj * m;
+                double *src = A + (size_t)(q*k + jj) * m;
+                for (int i=0;i<m;++i) dst[i] = src[i];
             }
-            store_submatrix(A, Ubuf, m, q*k, k);
+            for (int p = q + 1; p < blocks; ++p) {
+                for (int jj=0;jj<k;++jj) {
+                    double *dst = Ubuf + (size_t)(k + jj) * m;
+                    double *src = A + (size_t)(p*k + jj) * m;
+                    for (int i=0;i<m;++i) dst[i] = src[i];
+                }
+
+                int tk = 2*k;
+                dgemm_simple('T','N', tk, tk, m, 1.0, Ubuf, m, Ubuf, m, 0.0, G, tk);
+                jacobi_eigen_small(G, R, tk, 200, 1e-12);
+                dgemm_simple('N','N', m, tk, tk, 1.0, Ubuf, m, R, tk, 0.0, Utmp, m);
+                for (int col=0; col<tk; ++col) {
+                    double *src = Utmp + (size_t)col * m;
+                    double *dst = Ubuf + (size_t)col * m;
+                    for (int i=0;i<m;++i) dst[i] = src[i];
+                }
+                for (int jj=0;jj<k;++jj) {
+                    double *src = V + (size_t)(q*k + jj) * n;
+                    double *dst = Vsub + (size_t)jj * n;
+                    for (int i=0;i<n;++i) dst[i] = src[i];
+                }
+                for (int jj=0;jj<k;++jj) {
+                    double *src = V + (size_t)(p*k + jj) * n;
+                    double *dst = Vsub + (size_t)(k + jj) * n;
+                    for (int i=0;i<n;++i) dst[i] = src[i];
+                }
+                dgemm_simple('N','N', n, tk, tk, 1.0, Vsub, n, R, tk, 0.0, Vtmp, n);
+                for (int jj=0;jj<k;++jj) {
+                    double *src = Vtmp + (size_t)jj * n;
+                    double *dst = V + (size_t)(q*k + jj) * n;
+                    for (int i=0;i<n;++i) dst[i] = src[i];
+                }
+                for (int jj=0;jj<k;++jj) {
+                    double *src = Vtmp + (size_t)(k + jj) * n;
+                    double *dst = V + (size_t)(p*k + jj) * n;
+                    for (int i=0;i<n;++i) dst[i] = src[i];
+                }
+                for (int jj=0;jj<k;++jj) {
+                    double *src = Ubuf + (size_t)(k + jj) * m;
+                    double *dst = A + (size_t)(p*k + jj) * m;
+                    for (int i=0;i<m;++i) dst[i] = src[i];
+                }
+            }
+            for (int jj=0;jj<k;++jj) {
+                double *src = Ubuf + (size_t)jj * m;
+                double *dst = A + (size_t)(q*k + jj) * m;
+                for (int i=0;i<m;++i) dst[i] = src[i];
+            }
         }
-        for (int col = 0; col < n; ++col) {
-            double norm = sqrt(column_norm_sq(A, m, col));
-            if (norm > 1e-14) scale_column(A, m, col, 1.0/norm);
-        }
+        normalize_columns(A, m, n);
     }
 
     double t1 = wall_time();
-    printf("Elapsed time (BCV with V) = %.6f seconds\n", t1 - t0);
+    printf("Elapsed time(BCV with V, serial) = %.6f seconds\n", t1 - t0);
 
-    free(col_idx);
-    free_matrix(Ubuf, m);
-    free_matrix(V, n);
-    free_matrix(A, m);
+    free(A); free(V); free(Ubuf); free(G); free(R); free(Utmp); free(Vsub); free(Vtmp);
     return 0;
 }
