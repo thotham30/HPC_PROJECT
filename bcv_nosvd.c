@@ -1,4 +1,4 @@
-// corrected_bcv_simple.c  -- minimal fixes (contiguous column-major, offset loading, one local sweep)
+// bcv_nosvd.c  -- minimal fixes (contiguous column-major, offset loading, one local sweep)
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>

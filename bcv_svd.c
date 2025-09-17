@@ -1,4 +1,4 @@
-// bcv_svd_timed.c
+// bcv_svd.c
 // BCV Jacobi WITH V accumulation (full SVD).
 // Compile: gcc -O3 -march=native -std=c11 bcv_svd_timed.c -o bcv_svd_timed -lm
 // Run example: ./bcv_svd_timed 1500 1500 30 4
